@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app state and generated media
+.VocaVid/
+.musicvideo[g]en/
+.superpowers/
+images/
+website/assets/video/*.mp4
+VocaVid.sqlite3
+musicvideo[g]en.sqlite3
+*.sqlite
+*.sqlite3
+
+# Runtime logs
+*.log
+.VocaVid-server*.out.log
+.VocaVid-server*.err.log
+.musicvideo[g]en-server*.out.log
+.musicvideo[g]en-server*.err.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

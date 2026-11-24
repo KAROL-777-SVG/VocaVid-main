@@ -1,0 +1,1891 @@
+from __future__ import annotations
+
+import json
+import logging
+import secrets
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Callable
+from urllib.parse import quote
+from urllib.request import urlretrieve
+
+from .assembly import assemble_kdenlive_project, render_kdenlive_project, split_audio_segment
+from .alignment import align_lyrics_to_words, infer_language_from_lyrics, normalize_whisper_model_size, transcribe_words_with_fallback
+from .audio import get_wav_duration_sec
+from .comfy import ComfyClient, load_workflow, with_output_prefix
+from .lyrics import is_chorus_section, is_instrumental_section, parse_suno_lyrics
+from .models import LineTiming, LyricLine, RenderSegment
+from .paths import project_output_file_stem, resolve_storage_path, slug_folder_name, storage_relative_path
+from .promptgen import clean_generated_text, inject_promptgen_context, inject_raw_text_prompt, inject_scenefill_context, inject_videoprompt_context, make_global_style_prompt, make_videoprompt_prompt
+from .prompt_templates import load_named_prompt_template, render_prompt_template
+from .reels.media import ffmpeg_binary
+from .sceneplan import fallback_scene_plans, make_sceneplan_concept_prompt, make_sceneplan_prompt, parse_scene_plan_text
+from .segments import build_render_segments
+from .store import Store
+from .timing import apply_manual_timing, distribute_evenly
+from .workflows import WorkflowPaths
+from .worker import RetryableJobError
+
+
+logger = logging.getLogger(__name__)
+MIN_CONFIDENT_ALIGNMENT_RATIO = 0.30
+SCENE_PLAN_BATCH_SIZE = 12
+COMFY_TIMEOUT_SAMPLE_SIZE = 50
+COMFY_TIMEOUT_MULTIPLIER = 10
+COMFY_TIMEOUT_MIN_SEC = 300.0
+COMFY_CLIP_TIMEOUT_MIN_SEC = 900.0
+DEFAULT_AVATAR_IMAGE_TEMPLATE = """Edit Image 1 by replacing only the primary focus person with the identity from Image 2.
+
+Image prompt context:
+{IMAGE_PROMPT}
+
+Scene plan context:
+{SCENE_PLAN}
+
+Genre: {GENRE}
+Global visual style: {GLOBAL_STYLE}
+Avatar identity: {AVATAR_IDENTITY_CONTEXT}
+
+Target selection:
+Replace the main focus person in Image 1: the person closest to camera, most centered, largest in frame, most brightly lit, or visually treated as the subject. If multiple people are visible, replace only that focus person. Do not change background people, crowds, silhouettes, companions, enemies, or secondary characters.
+
+Identity transfer:
+Use Image 2 as the identity reference for the focus person. Transfer the face, facial structure, skin tone, age impression, hair, hairline, hair color, hairstyle, hair length, beard, moustache, facial hair, glasses, and overall body shape from Image 2.
+
+Hair and face priority:
+Replace all visible character hair with the hair from Image 2. Do not keep the original character's hair, hairline, hair color, hairstyle, beard, facial hair, or hair silhouette from Image 1.
+
+Preserve scene:
+Keep the background, mood, lighting, camera angle, composition, clothing, pose, posture, expression, gaze direction, and cinematic atmosphere from Image 1. Keep the outfit from Image 1 unless it conflicts with preserving the focus person's head and identity.
+
+Boundaries:
+Do not alter non-focus people. Do not add new people. Do not remove people. Do not change the scene, props, weapons, furniture, environment, framing, or style. Keep the result photorealistic and natural."""
+
+
+class Pipeline:
+    def __init__(self, store: Store, workspace: Path, ffmpeg_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run):
+        self.store = store
+        self.workspace = workspace
+        self.ffmpeg_runner = ffmpeg_runner
+        self.workflows = WorkflowPaths.defaults(Path.cwd())
+        self.kdenlive_template = Path.cwd() / "templates" / "kdenlivetemplate.kdenlive"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+
+    def _text_model_profile(self) -> str:
+        settings = self.store.get_global_settings()
+        return "qwen35" if str(settings["text_model_profile"] or "").strip() == "qwen35" else "gemma4"
+
+    def _promptgen_workflow_path(self) -> Path | None:
+        return self.workflows.optional_promptgen_for_profile(self._text_model_profile())
+
+    def _avatar_description_workflow_path(self) -> Path | None:
+        return self.workflows.optional_avatar_description_for_profile(self._text_model_profile())
+
+    def _avatar_image_profile(self) -> str:
+        return str(self.store.get_global_settings()["avatar_image_profile"] or "")
+
+    def _clip_generation_profile(self) -> str:
+        return str(self.store.get_global_settings()["clip_generation_profile"] or "")
+
+    def align_evenly(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        project = self.store.get_project(project_id)
+        lines = [
+            LyricLine(
+                index=row["line_index"],
+                section=row["section"],
+                raw_text=row["raw_text"],
+                clean_text=row["clean_text"],
+                is_chorus=bool(row["is_chorus"]),
+                use_reference=bool(row["use_reference"]),
+            )
+            for row in self.store.list_lines(project_id)
+        ]
+        duration = get_wav_duration_sec(self._project_input_path(project["audio_path"]))
+        selected_timings = self._filter_timings(distribute_evenly(lines, duration), selected_line_indices)
+        self.store.set_timings(project_id, selected_timings)
+        for timing in selected_timings:
+            self.store.update_line(project_id, timing.line_index, last_action="align")
+        if not selected_line_indices:
+            self.build_segments(project_id)
+
+    def align_with_whisper(self, project_id: int, selected_line_indices: list[int] | None = None, force_cpu: bool = False) -> None:
+        project = self.store.get_project(project_id)
+        lines = [
+            LyricLine(
+                index=row["line_index"],
+                section=row["section"],
+                raw_text=row["raw_text"],
+                clean_text=row["clean_text"],
+                is_chorus=bool(row["is_chorus"]),
+                use_reference=bool(row["use_reference"]),
+            )
+            for row in self.store.list_lines(project_id)
+        ]
+        audio_path = self._project_input_path(project["audio_path"])
+        duration = get_wav_duration_sec(audio_path)
+        language = infer_language_from_lyrics(lines)
+        whisper_model_size = normalize_whisper_model_size(_row_value(project, "whisper_model_size", "small"))
+        logger.info(
+            "align start project_id=%s lines=%s selected=%s audio=%s duration_sec=%.3f language=%s whisper_model_size=%s",
+            project_id,
+            len(lines),
+            selected_line_indices or "all",
+            audio_path,
+            duration,
+            language or "auto",
+            whisper_model_size,
+        )
+        fallback_error = ""
+        timings, fallback_error = self._compute_whisper_timings(
+            project_id,
+            project,
+            lines,
+            duration,
+            language,
+            force_cpu=force_cpu,
+        )
+        selected_timings = self._filter_timings(timings, selected_line_indices)
+        self._store_alignment_timings(project_id, selected_timings, fallback_error)
+        if not selected_line_indices:
+            self.build_segments(project_id)
+
+    def update_timing(self, project_id: int, line_index: int, start_sec: float, end_sec: float) -> None:
+        rows = self.store.list_lines(project_id)
+        row = next(item for item in rows if item["line_index"] == line_index)
+        current = LineTiming(
+            line_index=line_index,
+            start_sec=float(row["start_sec"] or 0),
+            end_sec=float(row["end_sec"] or 0),
+            confidence=float(row["confidence"] or 0),
+        )
+        updated = apply_manual_timing(current, start_sec=start_sec, end_sec=end_sec)
+        self.store.set_timings(project_id, [updated])
+
+    def update_segment_timing(self, project_id: int, segment_index: int, start_sec: float, end_sec: float) -> None:
+        start = float(start_sec)
+        end = float(end_sec)
+        if end <= start:
+            raise ValueError("end_sec must be greater than start_sec")
+        project = self.store.get_project(project_id)
+        segment = next(item for item in self.store.list_segments(project_id) if item["segment_index"] == segment_index)
+        stored_segment_index = int(segment["segment_index"])
+        audio_path = self._project_dir(project) / "audio-segments" / f"segment-{stored_segment_index:03d}.wav"
+        split_audio_segment(
+            self._project_input_path(project["audio_path"]),
+            start,
+            end,
+            audio_path,
+            runner=self.ffmpeg_runner,
+            source_root=self.workspace.parent,
+            output_root=self._project_dir(project),
+        )
+        self.store.update_segment(
+            project_id,
+            segment_index,
+            start_sec=start,
+            end_sec=end,
+            audio_path=self._project_storage_path(audio_path),
+            clip_path=None,
+            video_approved=0,
+            status="pending",
+            error="",
+        )
+
+    def update_segment_section(self, project_id: int, segment_index: int, section_type: str) -> None:
+        normalized = str(section_type or "").strip().casefold()
+        is_chorus = normalized in {"refrain", "chorus"}
+        section = "Bridge" if normalized == "bridge" else "Refrain" if is_chorus else "Verse"
+        self.store.update_segment(
+            project_id,
+            segment_index,
+            section=section,
+            is_chorus=int(is_chorus),
+            use_reference=int(is_chorus),
+        )
+
+    def save_manual_timing(self, project_id: int, rows: list[dict[str, object]]) -> None:
+        project = self.store.get_project(project_id)
+        cleaned_rows = []
+        interludes = []
+        for position, row in enumerate(rows):
+            is_interlude = str(row.get("row_type", "lyric")) == "interlude"
+            line_index = None if is_interlude else int(row["line_index"])
+            clean_text = str(row.get("clean_text", "")).strip() or ("[Instrumental]" if is_interlude else "")
+            if not clean_text:
+                continue
+            section = str(row.get("section", "")).strip() or ("Instrumental" if is_interlude else "Verse")
+            start = _parse_manual_time(row.get("start_sec", ""))
+            end = _parse_manual_time(row.get("end_sec", ""))
+            if end <= start:
+                label = "interlude" if is_interlude else f"line {line_index + 1}"
+                raise ValueError(f"Manual timing for {label} must end after it starts")
+            is_chorus = is_chorus_section(section)
+            manual_segment_start = is_interlude or bool(row.get("manual_segment_start")) or not cleaned_rows
+            cleaned_row = {
+                "line_index": line_index,
+                "section": section,
+                "is_chorus": is_chorus,
+                "use_reference": is_chorus,
+                "clean_text": clean_text,
+                "start_sec": start,
+                "end_sec": end,
+                "manual_segment_start": manual_segment_start,
+                "is_interlude": is_interlude,
+            }
+            cleaned_rows.append(cleaned_row)
+            if is_interlude:
+                after_line_index = row.get("after_line_index")
+                if after_line_index is None:
+                    raise ValueError("Manual interlude needs a position between lyric lines")
+                interludes.append({**cleaned_row, "after_line_index": int(after_line_index)})
+                continue
+            self.store.update_line(
+                project_id,
+                line_index,
+                section=section,
+                is_chorus=int(is_chorus),
+                use_reference=int(is_chorus),
+                raw_text=clean_text,
+                clean_text=clean_text,
+                start_sec=start,
+                end_sec=end,
+                confidence=1.0,
+                manual_segment_start=int(manual_segment_start),
+                prompt=None,
+                video_prompt=None,
+                image_path=None,
+                avatar_image_path=None,
+                clip_path=None,
+                video_approved=0,
+                last_action="align",
+                status="pending",
+                error="",
+            )
+        if not cleaned_rows:
+            raise ValueError("Manual timing needs at least one lyric line")
+
+        self.store.replace_manual_timing_interludes(project_id, interludes)
+
+        groups: list[list[dict[str, object]]] = []
+        current: list[dict[str, object]] = []
+        for row in cleaned_rows:
+            if (row["manual_segment_start"] or (current and current[-1]["is_interlude"])) and current:
+                groups.append(current)
+                current = []
+            current.append(row)
+        if current:
+            groups.append(current)
+
+        output_dir = self._project_dir(project) / "audio-segments"
+        segments: list[RenderSegment] = []
+        for index, group in enumerate(groups):
+            first = group[0]
+            start = float(first["start_sec"])
+            end = float(group[-1]["end_sec"])
+            section = str(first["section"])
+            text = "\n".join(str(item["clean_text"]) for item in group)
+            instrumental = is_instrumental_section(section) or is_instrumental_section(text)
+            audio_path = output_dir / f"segment-{index:03d}.wav"
+            split_audio_segment(
+                self._project_input_path(project["audio_path"]),
+                start,
+                end,
+                audio_path,
+                runner=self.ffmpeg_runner,
+                source_root=self.workspace.parent,
+                output_root=self._project_dir(project),
+            )
+            is_chorus = any(bool(item["is_chorus"]) for item in group)
+            segments.append(
+                RenderSegment(
+                    index=index,
+                    kind="gap" if instrumental else "lyrics",
+                    section=section,
+                    is_chorus=False if instrumental else is_chorus,
+                    use_reference=False if instrumental else is_chorus,
+                    source_line_indices=[int(item["line_index"]) for item in group if item["line_index"] is not None],
+                    clean_text=text,
+                    start_sec=round(start, 6),
+                    end_sec=round(end, 6),
+                    audio_path=self._project_storage_path(audio_path),
+                )
+            )
+        self.store.replace_segments(project_id, segments)
+        self.store.update_project(project_id, final_video_path=None, scene_plan=None)
+        logger.info("manual timing saved project_id=%s segments=%s", project_id, len(segments))
+
+    def build_segments(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        duration = get_wav_duration_sec(self._project_input_path(project["audio_path"]))
+        logger.info(
+            "build segments start project_id=%s lyric_group_size=%s chorus_group_size=%s duration_sec=%.3f",
+            project_id,
+            int(project["lyric_group_size"]),
+            int(project["chorus_group_size"]),
+            duration,
+        )
+        segments = build_render_segments(
+            self.store.list_lines(project_id),
+            duration,
+            lyric_group_size=int(project["lyric_group_size"]),
+            chorus_group_size=int(project["chorus_group_size"]),
+        )
+        gap_count = sum(1 for segment in segments if segment.kind == "gap")
+        logger.info("segments planned project_id=%s count=%s gaps=%s", project_id, len(segments), gap_count)
+        output_dir = self._project_dir(project) / "audio-segments"
+        split_segments = []
+        for segment in segments:
+            audio_path = output_dir / f"segment-{segment.index:03d}.wav"
+            logger.info(
+                "split audio start project_id=%s segment=%s/%s kind=%s start=%.3f end=%.3f",
+                project_id,
+                segment.index + 1,
+                len(segments),
+                segment.kind,
+                segment.start_sec,
+                segment.end_sec,
+            )
+            started = time.monotonic()
+            split_audio_segment(
+                self._project_input_path(project["audio_path"]),
+                segment.start_sec,
+                segment.end_sec,
+                audio_path,
+                runner=self.ffmpeg_runner,
+                source_root=self.workspace.parent,
+                output_root=self._project_dir(project),
+            )
+            logger.info(
+                "split audio done project_id=%s segment=%s/%s output=%s elapsed_sec=%.3f",
+                project_id,
+                segment.index + 1,
+                len(segments),
+                audio_path,
+                time.monotonic() - started,
+            )
+            split_segments.append(
+                type(segment)(
+                    index=segment.index,
+                    kind=segment.kind,
+                    section=segment.section,
+                    is_chorus=segment.is_chorus,
+                    use_reference=segment.use_reference,
+                    source_line_indices=segment.source_line_indices,
+                    clean_text=segment.clean_text,
+                    start_sec=segment.start_sec,
+                    end_sec=segment.end_sec,
+                    audio_path=self._project_storage_path(audio_path),
+                    scene_plan=segment.scene_plan,
+                )
+            )
+        self.store.replace_segments(project_id, split_segments)
+        logger.info("build segments done project_id=%s stored=%s", project_id, len(split_segments))
+
+    def generate_scene_plan(self, project_id: int, selected_segment_indices: list[int] | None = None) -> None:
+        project = self.store.get_project(project_id)
+        segments = self._selected_segments(project_id, selected_segment_indices)
+        if not segments:
+            return
+        workflow_path = self._promptgen_workflow_path()
+        plans: dict[int, str]
+        full_plan = ""
+        if workflow_path:
+            workflow = load_workflow(workflow_path)
+            client = ComfyClient(project["comfy_base_url"])
+            concept_result = client.run_workflow(inject_raw_text_prompt(workflow, make_sceneplan_concept_prompt(project, segments)), {})
+            video_bible = clean_generated_text(concept_result.text_outputs[0]) if concept_result.ok and concept_result.text_outputs else ""
+            plans = {}
+            fallback_indices: list[int] = []
+            batches = _scene_plan_batches(segments)
+            for batch_number, batch in enumerate(batches, start=1):
+                previous_scene_plans = list(plans.items())[-2:]
+                prompt = make_sceneplan_prompt(
+                    project,
+                    batch,
+                    video_bible=video_bible,
+                    previous_scene_plans=previous_scene_plans,
+                    batch_number=batch_number,
+                    batch_count=len(batches),
+                    full_project_total_segments=len(segments),
+                )
+                result = client.run_workflow(inject_raw_text_prompt(workflow, prompt), {})
+                expected_indices = [int(row["segment_index"]) for row in batch]
+                parsed = parse_scene_plan_text(clean_generated_text(result.text_outputs[0]), expected_indices) if result.ok and result.text_outputs else {}
+                fallback = fallback_scene_plans(project, batch)
+                for index in expected_indices:
+                    plans[index] = parsed.get(index) or fallback[index]
+                    if not parsed.get(index):
+                        fallback_indices.append(index)
+            segment_plan = "\n".join(f"{index}: {plan}" for index, plan in plans.items())
+            if fallback_indices:
+                full_plan = _format_scene_plan_text(
+                    plans,
+                    f"promptgen returned missing or unusable segment lines for segments {_format_indices(fallback_indices)}",
+                )
+            else:
+                full_plan = _format_successful_scene_plan_text(segment_plan, video_bible)
+        else:
+            plans = fallback_scene_plans(project, segments)
+            full_plan = _format_scene_plan_text(plans, "promptgen workflow is missing")
+        for index, plan in plans.items():
+            self.store.update_segment(project_id, index, scene_plan=plan, status="planned", error="", last_action="scene-plan")
+        self.store.update_project(project_id, scene_plan=full_plan)
+
+    def save_scene_plan(self, project_id: int, scene_plan: str) -> None:
+        segments = self.store.list_segments(project_id)
+        self.store.update_project(project_id, scene_plan=scene_plan)
+        parsed = parse_scene_plan_text(scene_plan, [int(row["segment_index"]) for row in segments])
+        for index, plan in parsed.items():
+            self.store.update_segment(project_id, index, scene_plan=plan)
+
+    def generate_global_style_prompt(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        lyrics = "\n".join(str(row["clean_text"]) for row in self.store.list_lines(project_id) if str(row["clean_text"]).strip())
+        prompt = make_global_style_prompt(str(project["genre"] or ""), lyrics)
+        style_prompt = ""
+        workflow_path = self._promptgen_workflow_path()
+        if workflow_path:
+            workflow = load_workflow(workflow_path)
+            client = ComfyClient(project["comfy_base_url"])
+            result = client.run_workflow(inject_raw_text_prompt(workflow, prompt), {})
+            if result.ok and result.text_outputs:
+                style_prompt = clean_generated_text(result.text_outputs[0])
+        if not style_prompt:
+            genre = str(project["genre"] or "music video").strip() or "music video"
+            style_prompt = (
+                f"{genre}, cinematic music video, cohesive visual language, expressive lighting, "
+                "strong atmosphere, detailed production design, emotionally synced to the lyrics"
+            )
+        self.store.update_project(project_id, global_style_prompt=style_prompt)
+
+    def describe_avatar_face(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        workflow_path = self._avatar_description_workflow_path()
+        if not workflow_path:
+            raise FileNotFoundError(f"avatar_description workflow is missing: put the exported ComfyUI workflow at {self.workflows.avatar_description}")
+        reference_image_path = self._project_avatar_reference_path(project)
+        workflow = load_workflow(workflow_path)
+        variables = {
+            "reference_image_path": reference_image_path,
+            "reference_image_name": Path(reference_image_path).name,
+            "avatar_gender": _normalize_avatar_gender(_row_value(project, "avatar_gender", "")),
+            "avatar_face_description": _row_value(project, "avatar_face_description", "") or "",
+            "avatar_identity_context": _avatar_identity_context(project),
+            "avatar_description_prompt": (
+                "Describe the visible face and identity cues of this avatar reference image for reuse in AI music-video prompts. "
+                "Return only a concise neutral visual description of the face, hair, age impression, expression, and distinctive facial features. "
+                "Do not identify the person and do not add markdown."
+            ),
+        }
+        workflow = _inject_avatar_description_image(workflow, variables)
+        try:
+            workflow = inject_raw_text_prompt(workflow, str(variables["avatar_description_prompt"]))
+        except ValueError:
+            pass
+        result = ComfyClient(project["comfy_base_url"]).run_workflow(workflow, variables)
+        if result.ok and result.text_outputs:
+            self.store.update_project(project_id, avatar_face_description=clean_generated_text(result.text_outputs[0]))
+            return
+        raise RuntimeError(result.error or "No avatar face description text output")
+
+    def generate_prompts(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        project = self.store.get_project(project_id)
+        selected_segments = self._selected_segments(project_id, selected_line_indices)
+        if selected_segments:
+            segments = _editable_rows(selected_segments)
+            if not segments:
+                return
+            workflow_path = self._promptgen_workflow_path()
+            if not workflow_path:
+                for row in segments:
+                    scene_plan = f"\nScene plan: {row['scene_plan']}" if row["scene_plan"] else ""
+                    avatar_context = (
+                        f"\nAvatar identity: {_avatar_identity_context(project)}"
+                        if bool(row["use_reference"]) and _avatar_identity_context(project)
+                        else ""
+                    )
+                    prompt = f"{row['clean_text']}.{scene_plan} {project['global_style_prompt']}{avatar_context}".strip()
+                    self.store.update_segment(project_id, row["segment_index"], prompt=prompt, status="prompted", error="", last_action="prompts")
+                return
+            for row in segments:
+                self._run_comfy_for_segment_prompt(project_id, row, workflow_path)
+            return
+        workflow_path = self._promptgen_workflow_path()
+        if not workflow_path:
+            for row in self._editable_selected_rows(project_id, selected_line_indices):
+                avatar_context = (
+                    f"\nAvatar identity: {_avatar_identity_context(project)}"
+                    if bool(row["use_reference"]) and _avatar_identity_context(project)
+                    else ""
+                )
+                prompt = f"{row['clean_text']}. {project['global_style_prompt']}{avatar_context}".strip()
+                self.store.update_line(project_id, row["line_index"], prompt=prompt, status="prompted", error="", last_action="prompts")
+            return
+        for row in self._editable_selected_rows(project_id, selected_line_indices):
+            self._run_comfy_for_prompt(project_id, row, workflow_path)
+
+    def generate_images(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        selected_segments = self._selected_segments(project_id, selected_line_indices)
+        if selected_segments:
+            segments = selected_segments if selected_line_indices else _editable_rows(selected_segments)
+            if not segments:
+                return
+            for row in segments:
+                workflow = self.workflows.image_for_reference(bool(row["use_reference"]))
+                self._run_comfy_for_segment(project_id, row, workflow, output_field="image_path", action="images")
+            return
+        rows = self._selected_rows(project_id, selected_line_indices) if selected_line_indices else self._editable_selected_rows(project_id, selected_line_indices)
+        for row in rows:
+            workflow = self.workflows.image_for_reference(bool(row["use_reference"]))
+            self._run_comfy_for_line(project_id, row, workflow, output_field="image_path", action="images")
+
+    def generate_avatar_images(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        profile = self._avatar_image_profile()
+        workflow = self.workflows.require_avatar_image(profile)
+        selected_segments = self._selected_segments(project_id, selected_line_indices)
+        if selected_segments:
+            segments = selected_segments if selected_line_indices else _editable_rows(selected_segments)
+            if not segments:
+                return
+            for row in segments:
+                self._run_comfy_for_avatar_segment(project_id, row, workflow)
+            return
+        rows = self._selected_rows(project_id, selected_line_indices) if selected_line_indices else self._editable_selected_rows(project_id, selected_line_indices)
+        for row in rows:
+            self._run_comfy_for_avatar_line(project_id, row, workflow)
+
+    def generate_video_prompts(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        project = self.store.get_project(project_id)
+        selected_segments = self._selected_segments(project_id, selected_line_indices)
+        if selected_segments:
+            segments = _editable_rows(selected_segments)
+            if not segments:
+                return
+            workflow_path = self._promptgen_workflow_path()
+            if not workflow_path:
+                for row in segments:
+                    prompt = make_videoprompt_prompt(
+                        lyric_text=str(row["clean_text"]),
+                        image_prompt=str(row["prompt"] or ""),
+                        section=str(row["section"]),
+                        is_chorus=bool(row["is_chorus"]),
+                        global_style=str(project["global_style_prompt"]),
+                        duration=f"{float(row['end_sec']) - float(row['start_sec']):.3f}",
+                        genre=str(project["genre"] or ""),
+                        scene_plan=str(row["scene_plan"] or ""),
+                        avatar_identity_context=_avatar_identity_context(project) if bool(row["use_reference"]) else "",
+                    )
+                    self.store.update_segment(
+                        project_id,
+                        row["segment_index"],
+                        video_prompt=prompt,
+                        clip_path=None,
+                        video_approved=0,
+                        status="video prompted",
+                        error="",
+                        last_action="video-prompts",
+                    )
+                return
+            for row in segments:
+                self._run_comfy_for_segment_video_prompt(project_id, row, workflow_path)
+            return
+
+        workflow_path = self._promptgen_workflow_path()
+        if not workflow_path:
+            for row in self._editable_selected_rows(project_id, selected_line_indices):
+                duration = 0.0
+                if row["start_sec"] is not None and row["end_sec"] is not None:
+                    duration = float(row["end_sec"]) - float(row["start_sec"])
+                prompt = make_videoprompt_prompt(
+                    lyric_text=str(row["clean_text"]),
+                    image_prompt=str(row["prompt"] or ""),
+                    section=str(row["section"]),
+                    is_chorus=bool(row["is_chorus"]),
+                    global_style=str(project["global_style_prompt"]),
+                    duration=f"{duration:.3f}",
+                    genre=str(project["genre"] or ""),
+                    avatar_identity_context=_avatar_identity_context(project) if bool(row["use_reference"]) else "",
+                )
+                self.store.update_line(
+                    project_id,
+                    row["line_index"],
+                    video_prompt=prompt,
+                    clip_path=None,
+                    video_approved=0,
+                    status="video prompted",
+                    error="",
+                    last_action="video-prompts",
+                )
+            return
+        for row in self._editable_selected_rows(project_id, selected_line_indices):
+            self._run_comfy_for_line_video_prompt(project_id, row, workflow_path)
+
+    def generate_clips(self, project_id: int, selected_line_indices: list[int] | None = None) -> None:
+        selected_segments = self._selected_segments(project_id, selected_line_indices)
+        if selected_segments:
+            segments = selected_segments if selected_line_indices else _editable_rows(selected_segments)
+            if not segments:
+                return
+            for row in segments:
+                workflow = self.workflows.require_video_for_profile(self._clip_generation_profile())
+                self._run_comfy_for_segment(project_id, row, workflow, output_field="clip_path", prefer_avatar=True, action="clips")
+            return
+        rows = self._selected_rows(project_id, selected_line_indices) if selected_line_indices else self._editable_selected_rows(project_id, selected_line_indices)
+        for row in rows:
+            workflow = self.workflows.require_video_for_profile(self._clip_generation_profile())
+            self._run_comfy_for_line(project_id, row, workflow, output_field="clip_path", prefer_avatar=True, action="clips")
+
+    def generate_spotify_canvas_prompt(
+        self,
+        project_id: int,
+        item_kind: str,
+        item_index: int,
+        duration_sec: float,
+        draft: str = "",
+    ) -> str:
+        project = self.store.get_project(project_id)
+        row = self._canvas_source_row(project_id, item_kind, item_index)
+        workflow_path = self._promptgen_workflow_path()
+        if not workflow_path:
+            raise FileNotFoundError("promptgen workflow is missing")
+        request = f"""Create one concise image-to-video motion prompt for a Spotify Canvas.
+Return only the prompt, without labels, markdown, quotes, or explanation.
+
+The result is a silent {duration_sec:.2f}-second vertical 9:16 visual loop. Preserve the input image's identity, face, wardrobe, setting, lighting, objects, framing, and composition. Use one continuous shot. Motion must be readable on a phone screen. Design the final moment to connect naturally back to the first moment; prefer cyclical environmental or camera motion and avoid cuts, scene changes, new people, new props, text, logos, and large body movement.
+
+Genre: {project['genre'] or ''}
+Global style: {project['global_style_prompt'] or ''}
+Section: {row['section'] or ''}
+Scene plan: {row['scene_plan'] or ''}
+Lyrics/context: {row['clean_text'] or ''}
+Image prompt: {row['prompt'] or ''}
+User direction: {draft.strip() or 'Choose the strongest loopable motion for this image.'}
+"""
+        workflow = load_workflow(workflow_path)
+        result = ComfyClient(project["comfy_base_url"]).run_workflow(inject_raw_text_prompt(workflow, request), {})
+        if not result.ok or not result.text_outputs:
+            raise RuntimeError(result.error or "Prompt generation returned no text")
+        return clean_generated_text(result.text_outputs[0])
+
+    def generate_spotify_canvas_video(
+        self,
+        project_id: int,
+        item_kind: str,
+        item_index: int,
+        duration_sec: float,
+        video_prompt: str,
+    ) -> Path:
+        project = self.store.get_project(project_id)
+        row = dict(self._canvas_source_row(project_id, item_kind, item_index))
+        if not (row.get("avatar_image_path") or row.get("image_path")):
+            raise ValueError("The selected storyboard scene needs a generated image first")
+        if not row.get("audio_path"):
+            raise ValueError("The selected storyboard scene needs its split audio before video generation")
+        row["video_prompt"] = video_prompt
+        row["end_sec"] = float(row.get("start_sec") or 0.0) + float(duration_sec)
+        source_audio = self._project_input_path(row["audio_path"])
+        conditioning_dir = self._project_dir(project, project_id) / "spotify-canvas"
+        conditioning_dir.mkdir(parents=True, exist_ok=True)
+        conditioning_audio = conditioning_dir / "conditioning.wav"
+        audio_result = subprocess.run(
+            [
+                ffmpeg_binary(), "-y", "-stream_loop", "-1", "-i", str(source_audio),
+                "-t", f"{float(duration_sec):.3f}", "-ac", "1", "-ar", "44100", str(conditioning_audio),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if audio_result.returncode != 0:
+            raise RuntimeError((audio_result.stderr or "Could not prepare Canvas conditioning audio").strip())
+        row["audio_path"] = str(conditioning_audio)
+        workflow_path = self.workflows.require_video_for_profile(self._clip_generation_profile())
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row, prefer_avatar=True)
+        variables["duration"] = f"{float(duration_sec):.3f}"
+        variables = _upload_clip_workflow_inputs(client, variables, self._project_folder_name(project))
+        workflow = _inject_image_audio_video_inputs(workflow, variables)
+        workflow = _randomize_workflow_seeds(workflow)
+        prefix = f"VocaVid/{self._project_folder_name(project)}/spotify-canvas-{int(time.time() * 1000)}"
+        workflow = with_output_prefix(workflow, prefix)
+        targets = _output_node_ids(workflow, {"savevideo", "savewebm"})
+        result = client.run_workflow(workflow, variables, partial_execution_targets=targets)
+        if not result.ok or not result.output_files:
+            self._raise_if_comfy_timeout(result.error)
+            raise RuntimeError(result.error or "Canvas video generation returned no file")
+        return self._localize_comfy_output(
+            project,
+            project_id=project_id,
+            item_kind="spotify-canvas",
+            item_index=0,
+            output_field="clip_path",
+            output_path=result.output_files[0],
+        )
+
+    def _canvas_source_row(self, project_id: int, item_kind: str, item_index: int):
+        if item_kind != "segments":
+            raise ValueError("Spotify Canvas generation currently requires a storyboard segment")
+        row = next((item for item in self.store.list_segments(project_id) if int(item["segment_index"]) == int(item_index)), None)
+        if row is None:
+            raise KeyError(f"Storyboard segment {item_index} not found")
+        return row
+
+    def assemble(self, project_id: int, selected_line_indices: list[int] | None = None) -> Path:
+        if not self.all_videos_approved(project_id):
+            raise ValueError("Cannot assemble final video: not approved")
+        project = self.store.get_project(project_id)
+        segments = self._selected_segments(project_id, selected_line_indices)
+        rows = segments or self._selected_rows(project_id, selected_line_indices)
+        clips = [
+            {
+                "path": self._project_input_path(row["clip_path"]),
+                "start_sec": float(row["start_sec"]),
+                "end_sec": float(row["end_sec"]),
+            }
+            for row in rows
+            if row["clip_path"]
+        ]
+        output = self._project_dir(project) / f"{project_output_file_stem(str(project['name']))}.kdenlive"
+        render_target = output.with_suffix(".mp4")
+        result = assemble_kdenlive_project(
+            clips,
+            self._project_input_path(project["audio_path"]),
+            output,
+            self.kdenlive_template,
+            transition_handle_seconds=float(project["transition_handle_seconds"]),
+            render_target_path=render_target,
+        )
+        self.store.update_project(project_id, final_video_path=self._project_storage_path(result))
+        return result
+
+    def render_final_mp4(self, project_id: int) -> Path:
+        project = self.store.get_project(project_id)
+        project_path = self._project_input_path(project["final_video_path"] or "")
+        if not project_path.exists() or project_path.suffix.lower() != ".kdenlive":
+            project_path = self.assemble(project_id)
+        output = self._project_dir(project) / f"{project_output_file_stem(str(project['name']))}.mp4"
+        return render_kdenlive_project(project_path, output)
+
+    def retry_line(self, project_id: int, line_index: int) -> None:
+        self.store.update_line(project_id, line_index, status="pending", error="")
+
+    def insert_line_after(self, project_id: int, line_index: int, text: str, section: str = "") -> None:
+        rows = self.store.list_lines(project_id)
+        previous = next(item for item in rows if item["line_index"] == line_index)
+        selected_section = section.strip() or str(previous["section"])
+        parsed = parse_suno_lyrics(f"[{selected_section}]\n{text}")
+        if not parsed:
+            raise ValueError("Line text must not be empty")
+        line = parsed[0]
+        self.store.insert_line_after(
+            project_id,
+            line_index,
+            section=line.section,
+            raw_text=line.raw_text,
+            clean_text=line.clean_text,
+            is_chorus=line.is_chorus,
+            use_reference=line.use_reference,
+        )
+
+    def delete_line(self, project_id: int, line_index: int) -> None:
+        self.store.delete_line(project_id, line_index)
+
+    def save_line_prompts(self, project_id: int, line_index: int, prompt: str, video_prompt: str) -> None:
+        self.store.update_line(project_id, line_index, prompt=prompt, video_prompt=video_prompt)
+
+    def save_segment_prompts(self, project_id: int, segment_index: int, prompt: str, video_prompt: str) -> None:
+        self.store.update_segment(project_id, segment_index, prompt=prompt, video_prompt=video_prompt)
+
+    def save_line_prompt(self, project_id: int, line_index: int, prompt: str) -> None:
+        self.store.update_line(project_id, line_index, prompt=prompt)
+
+    def save_line_video_prompt(self, project_id: int, line_index: int, video_prompt: str) -> None:
+        self.store.update_line(project_id, line_index, video_prompt=video_prompt)
+
+    def save_segment_prompt(self, project_id: int, segment_index: int, prompt: str) -> None:
+        self.store.update_segment(project_id, segment_index, prompt=prompt)
+
+    def save_segment_video_prompt(self, project_id: int, segment_index: int, video_prompt: str) -> None:
+        self.store.update_segment(project_id, segment_index, video_prompt=video_prompt)
+
+    def ai_fill_line_prompt(self, project_id: int, line_index: int, target_field: str, draft_text: str) -> None:
+        row = next(item for item in self.store.list_lines(project_id) if item["line_index"] == line_index)
+        self._run_comfy_for_scene_fill(project_id, row, "lines", target_field, draft_text)
+
+    def ai_fill_segment_prompt(self, project_id: int, segment_index: int, target_field: str, draft_text: str) -> None:
+        row = next(item for item in self.store.list_segments(project_id) if item["segment_index"] == segment_index)
+        self._run_comfy_for_scene_fill(project_id, row, "segments", target_field, draft_text)
+
+    def select_line_image_source(self, project_id: int, line_index: int, selected_image_source: str) -> None:
+        self.store.update_line(project_id, line_index, selected_image_source=_normalize_image_source(selected_image_source))
+
+    def select_segment_image_source(self, project_id: int, segment_index: int, selected_image_source: str) -> None:
+        self.store.update_segment(project_id, segment_index, selected_image_source=_normalize_image_source(selected_image_source))
+
+    def set_line_video_approved(self, project_id: int, line_index: int, approved: bool) -> None:
+        self.store.update_line(project_id, line_index, video_approved=int(bool(approved)))
+
+    def set_segment_video_approved(self, project_id: int, segment_index: int, approved: bool) -> None:
+        self.store.update_segment(project_id, segment_index, video_approved=int(bool(approved)))
+
+    def all_videos_approved(self, project_id: int) -> bool:
+        rows = self.store.list_segments(project_id) or self.store.list_lines(project_id)
+        return bool(rows) and all(bool(_row_value(row, "video_approved", 0)) for row in rows)
+
+    def _project_dir(self, project, project_id: int | None = None) -> Path:
+        return self.workspace / self._project_folder_name(project, project_id)
+
+    def _project_input_path(self, value: str | Path) -> Path:
+        return resolve_storage_path(self.workspace.parent, value)
+
+    def _project_storage_path(self, value: str | Path) -> str:
+        return storage_relative_path(self.workspace.parent, value)
+
+    def _project_folder_name(self, project, project_id: int | None = None) -> str:
+        name = _row_value(project, "name", "")
+        if name:
+            return slug_folder_name(str(name))
+        return f"project-{project_id}" if project_id is not None else "project"
+
+    def _success_fields(self, output_field: str, output_path: str) -> dict[str, object]:
+        fields: dict[str, object] = {output_field: output_path, "status": "done", "error": ""}
+        if output_field == "image_path":
+            fields.update({"avatar_image_path": None, "clip_path": None, "video_approved": 0})
+        elif output_field == "avatar_image_path":
+            fields.update({"clip_path": None, "video_approved": 0})
+        elif output_field == "clip_path":
+            fields.update({"video_approved": 0})
+        return fields
+
+    def clear_project(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        lyrics_path = self._project_input_path(project["lyrics_path"])
+        lines = parse_suno_lyrics(lyrics_path.read_text(encoding="utf-8"))
+        project_dir = self._project_dir(project).resolve()
+        workspace = self.workspace.resolve()
+        if workspace not in project_dir.parents:
+            raise ValueError(f"Refusing to clear path outside workspace: {project_dir}")
+        if project_dir.exists():
+            shutil.rmtree(project_dir)
+        self.store.clear_project_generated_state(project_id)
+        self.store.replace_lines(project_id, lines)
+
+    def regroup_project(self, project_id: int, force_cpu: bool = False) -> None:
+        logger.info("regroup start project_id=%s", project_id)
+        project = self.store.get_project(project_id)
+        project_dir = self._project_dir(project).resolve()
+        workspace = self.workspace.resolve()
+        if workspace not in project_dir.parents:
+            raise ValueError(f"Refusing to regroup path outside workspace: {project_dir}")
+        lyrics_path = self._project_input_path(project["lyrics_path"])
+        lines = parse_suno_lyrics(lyrics_path.read_text(encoding="utf-8"))
+        audio_path = self._project_input_path(project["audio_path"])
+        duration = get_wav_duration_sec(audio_path)
+        timings, fallback_error = self._compute_whisper_timings(
+            project_id,
+            project,
+            lines,
+            duration,
+            infer_language_from_lyrics(lines),
+            force_cpu=force_cpu,
+        )
+        if project_dir.exists():
+            shutil.rmtree(project_dir)
+        self.store.clear_project_generated_state(project_id)
+        self.store.replace_lines(project_id, lines)
+        logger.info("clear generated state done project_id=%s output_dir=%s", project_id, project_dir)
+        try:
+            self._store_alignment_timings(project_id, timings, fallback_error)
+            self.build_segments(project_id)
+        except Exception:
+            logger.exception("regroup failed project_id=%s", project_id)
+            raise
+        logger.info("regroup done project_id=%s", project_id)
+
+    def _compute_whisper_timings(
+        self,
+        project_id: int,
+        project,
+        lines: list[LyricLine],
+        duration: float,
+        language: str | None,
+        force_cpu: bool = False,
+    ) -> tuple[list[LineTiming], str]:
+        audio_path = self._project_input_path(project["audio_path"])
+        whisper_model_size = normalize_whisper_model_size(_row_value(project, "whisper_model_size", "small"))
+        started = time.monotonic()
+        logger.info("whisper transcribe start project_id=%s audio=%s", project_id, audio_path)
+        words = transcribe_words_with_fallback(
+            audio_path,
+            language=language,
+            prefer_device="cpu" if force_cpu else "cuda",
+            model_size=whisper_model_size,
+        )
+        logger.info(
+            "whisper transcribe done project_id=%s words=%s elapsed_sec=%.3f",
+            project_id,
+            len(words),
+            time.monotonic() - started,
+        )
+        started = time.monotonic()
+        timings = align_lyrics_to_words(lines, words, duration)
+        lyric_line_indices = {line.index for line in lines if not _is_instrumental_line(line)}
+        high_confidence = sum(
+            1
+            for timing in timings
+            if timing.line_index in lyric_line_indices and timing.confidence >= 0.45
+        )
+        fallback_error = ""
+        lyric_line_count = len(lyric_line_indices)
+        if lyric_line_count and high_confidence / lyric_line_count < MIN_CONFIDENT_ALIGNMENT_RATIO:
+            fallback_error = (
+                f"Sparse Whisper alignment; transcript-window fallback "
+                f"({high_confidence}/{lyric_line_count} confident lyric lines)"
+            )
+            logger.info(
+                "lyrics alignment too sparse; using transcript-window fallback project_id=%s high_confidence=%s lines=%s words=%s min_ratio=%.2f",
+                project_id,
+                high_confidence,
+                lyric_line_count,
+                len(words),
+                MIN_CONFIDENT_ALIGNMENT_RATIO,
+            )
+            timings = _distribute_in_transcript_window(lines, duration, words)
+            high_confidence = 0
+        logger.info(
+            "lyrics alignment done project_id=%s timings=%s high_confidence=%s low_confidence=%s elapsed_sec=%.3f",
+            project_id,
+            len(timings),
+            high_confidence,
+            len(timings) - high_confidence,
+            time.monotonic() - started,
+        )
+        return timings, fallback_error
+
+    def _store_alignment_timings(self, project_id: int, timings: list[LineTiming], fallback_error: str) -> None:
+        self.store.set_timings(project_id, timings)
+        logger.info("timings stored project_id=%s count=%s", project_id, len(timings))
+        for timing in timings:
+            if fallback_error:
+                error = fallback_error
+            else:
+                error = "" if timing.confidence >= 0.45 else "Low confidence alignment; fallback timing"
+            self.store.update_line(project_id, timing.line_index, error=error, last_action="align")
+
+    def delete_project(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        self.clear_project(project_id)
+        self._delete_project_upload_dir(project)
+        self.store.delete_project(project_id)
+
+    def _delete_project_upload_dir(self, project) -> None:
+        app_root = self.workspace.resolve().parent
+        uploads_root = (app_root / "uploads").resolve()
+        candidates = [self._project_input_path(project["audio_path"]), self._project_input_path(project["lyrics_path"])]
+        for raw_path in candidates:
+            try:
+                parent = raw_path.resolve().parent
+                parent.relative_to(uploads_root)
+            except (OSError, ValueError):
+                continue
+            if parent.exists():
+                shutil.rmtree(parent)
+            return
+
+    def _selected_rows(self, project_id: int, selected_line_indices: list[int] | None):
+        rows = self.store.list_lines(project_id)
+        selected = set(selected_line_indices or [])
+        if not selected:
+            return rows
+        return [row for row in rows if row["line_index"] in selected]
+
+    def _selected_segments(self, project_id: int, selected_segment_indices: list[int] | None):
+        rows = self.store.list_segments(project_id)
+        selected = set(selected_segment_indices or [])
+        if not selected:
+            return rows
+        return [row for row in rows if row["segment_index"] in selected]
+
+    def _editable_selected_rows(self, project_id: int, selected_line_indices: list[int] | None):
+        return [row for row in self._selected_rows(project_id, selected_line_indices) if not bool(_row_value(row, "video_approved", 0))]
+
+    def _filter_timings(self, timings: list[LineTiming], selected_line_indices: list[int] | None) -> list[LineTiming]:
+        selected = set(selected_line_indices or [])
+        if not selected:
+            return timings
+        return [timing for timing in timings if timing.line_index in selected]
+
+    def _line_timings_missing(self, project_id: int) -> bool:
+        return any(row["start_sec"] is None or row["end_sec"] is None for row in self.store.list_lines(project_id))
+
+    def _fill_missing_line_timings_evenly(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        rows = self.store.list_lines(project_id)
+        lines = [
+            LyricLine(
+                index=row["line_index"],
+                section=row["section"],
+                raw_text=row["raw_text"],
+                clean_text=row["clean_text"],
+                is_chorus=bool(row["is_chorus"]),
+                use_reference=bool(row["use_reference"]),
+            )
+            for row in rows
+        ]
+        duration = get_wav_duration_sec(self._project_input_path(project["audio_path"]))
+        fallback_timings = distribute_evenly(lines, duration)
+        missing = {int(row["line_index"]) for row in rows if row["start_sec"] is None or row["end_sec"] is None}
+        self.store.set_timings(project_id, [timing for timing in fallback_timings if timing.line_index in missing])
+
+    def _align_line_timings_with_fallback(self, project_id: int) -> None:
+        project = self.store.get_project(project_id)
+        lines = [
+            LyricLine(
+                index=row["line_index"],
+                section=row["section"],
+                raw_text=row["raw_text"],
+                clean_text=row["clean_text"],
+                is_chorus=bool(row["is_chorus"]),
+                use_reference=bool(row["use_reference"]),
+            )
+            for row in self.store.list_lines(project_id)
+        ]
+        audio_path = self._project_input_path(project["audio_path"])
+        duration = get_wav_duration_sec(audio_path)
+        whisper_model_size = normalize_whisper_model_size(_row_value(project, "whisper_model_size", "small"))
+        words = transcribe_words_with_fallback(
+            audio_path,
+            language=infer_language_from_lyrics(lines),
+            model_size=whisper_model_size,
+        )
+        timings = align_lyrics_to_words(lines, words, duration)
+        self.store.set_timings(project_id, timings)
+
+    def _run_comfy_for_lines(self, project_id: int, workflow_path: Path, output_field: str) -> None:
+        for row in self.store.list_lines(project_id):
+            self._run_comfy_for_line(project_id, row, workflow_path, output_field)
+
+    def _run_comfy_for_line(
+        self,
+        project_id: int,
+        row,
+        workflow_path: Path,
+        output_field: str,
+        prefer_avatar: bool = False,
+        action: str | None = None,
+    ) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row, prefer_avatar=prefer_avatar)
+        prefix = f"VocaVid/{self._project_folder_name(project)}/line-{row['line_index']}-{int(time.time() * 1000)}"
+        partial_execution_targets = None
+        self.store.update_line(project_id, row["line_index"], status="running", error="", last_action=action or output_field)
+        try:
+            if output_field == "clip_path":
+                variables = _with_transition_handle_duration(project, variables)
+                variables = _upload_clip_workflow_inputs(client, variables, self._project_folder_name(project))
+                workflow = _inject_image_audio_video_inputs(workflow, variables)
+                workflow = _randomize_workflow_seeds(workflow)
+                partial_execution_targets = _output_node_ids(workflow, {"savevideo", "savewebm"})
+            elif output_field == "image_path":
+                workflow = _randomize_workflow_seeds(workflow)
+            workflow = with_output_prefix(workflow, prefix)
+        except Exception as exc:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=str(exc))
+            return
+        result = self._run_comfy_workflow(client, workflow, variables, partial_execution_targets, action, project, row)
+        if result.ok and result.output_files:
+            stored_output = self._localize_comfy_output(
+                project,
+                project_id=project_id,
+                item_kind="line",
+                item_index=int(row["line_index"]),
+                output_field=output_field,
+                output_path=result.output_files[0],
+            )
+            self.store.update_line(
+                project_id,
+                row["line_index"],
+                **self._success_fields(output_field, self._project_storage_path(stored_output)),
+            )
+        elif result.ok and output_field == "prompt":
+            self.store.update_line(project_id, row["line_index"], prompt=json.dumps(result.output_files), status="done", error="")
+        else:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=result.error or "No output files")
+            self._raise_if_comfy_timeout(result.error)
+
+    def _run_comfy_for_segment(
+        self,
+        project_id: int,
+        row,
+        workflow_path: Path,
+        output_field: str,
+        prefer_avatar: bool = False,
+        action: str | None = None,
+    ) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row, prefer_avatar=prefer_avatar)
+        prefix = f"VocaVid/{self._project_folder_name(project)}/segment-{row['segment_index']}-{int(time.time() * 1000)}"
+        partial_execution_targets = None
+        self.store.update_segment(project_id, row["segment_index"], status="running", error="", last_action=action or output_field)
+        try:
+            if output_field == "clip_path":
+                variables = _with_transition_handle_duration(project, variables)
+                variables = _upload_clip_workflow_inputs(client, variables, self._project_folder_name(project))
+                workflow = _inject_image_audio_video_inputs(workflow, variables)
+                workflow = _randomize_workflow_seeds(workflow)
+                partial_execution_targets = _output_node_ids(workflow, {"savevideo", "savewebm"})
+            elif output_field == "image_path":
+                workflow = _randomize_workflow_seeds(workflow)
+            workflow = with_output_prefix(workflow, prefix)
+        except Exception as exc:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=str(exc))
+            return
+        result = self._run_comfy_workflow(client, workflow, variables, partial_execution_targets, action, project, row)
+        if result.ok and result.output_files:
+            stored_output = self._localize_comfy_output(
+                project,
+                project_id=project_id,
+                item_kind="segment",
+                item_index=int(row["segment_index"]),
+                output_field=output_field,
+                output_path=result.output_files[0],
+            )
+            self.store.update_segment(
+                project_id,
+                row["segment_index"],
+                **self._success_fields(output_field, self._project_storage_path(stored_output)),
+            )
+        else:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=result.error or "No output files")
+            self._raise_if_comfy_timeout(result.error)
+
+    def _run_comfy_workflow(self, client, workflow, variables, partial_execution_targets, action, project, row):
+        kwargs = {}
+        if partial_execution_targets is not None:
+            kwargs["partial_execution_targets"] = partial_execution_targets
+        timeout_sec = self._comfy_timeout_seconds(action, project, row)
+        if timeout_sec is not None:
+            kwargs["timeout_sec"] = timeout_sec
+        return client.run_workflow(workflow, variables, **kwargs)
+
+    def _comfy_timeout_seconds(self, action: str | None, project, row) -> float | None:
+        """Use a learned limit only once there is enough stable history."""
+        if not action:
+            return None
+        settings = self.store.get_global_settings()
+        text_profile = str(project["text_model_profile"] or "qwen35") if action in {"prompts", "video-prompts"} else "qwen35"
+        avatar_profile = str(settings["avatar_image_profile"] or "flux2-klein-4b-distilled")
+        clip_profile = str(settings["clip_generation_profile"] or "ltx23-quality")
+        if self.store.completed_job_count(action, text_profile, avatar_profile, clip_profile) < COMFY_TIMEOUT_SAMPLE_SIZE:
+            return None
+        average = self.store.average_job_durations(text_profile, avatar_profile, clip_profile).get(action)
+        if not average:
+            return None
+        expected = float(average)
+        if action == "clips":
+            handle = max(0.0, float(project["transition_handle_seconds"] or 0.0))
+            expected *= max(0.1, float(row["end_sec"] or 0.0) - float(row["start_sec"] or 0.0) + handle)
+        minimum = COMFY_CLIP_TIMEOUT_MIN_SEC if action == "clips" else COMFY_TIMEOUT_MIN_SEC
+        return max(minimum, expected * COMFY_TIMEOUT_MULTIPLIER)
+
+    @staticmethod
+    def _raise_if_comfy_timeout(error: str) -> None:
+        if str(error).startswith("COMFY_TIMEOUT:"):
+            raise RetryableJobError(str(error))
+
+    def _run_comfy_for_avatar_line(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_line(project_id, row["line_index"], status="running", error="", last_action="avatar-image")
+        try:
+            variables = _upload_avatar_workflow_inputs(client, variables, self._project_folder_name(project))
+            workflow = _inject_avatar_load_images(workflow, variables)
+            workflow = _inject_avatar_prompt(workflow, variables)
+            workflow = _randomize_workflow_seeds(workflow)
+            prefix = f"VocaVid/{self._project_folder_name(project)}/avatar-line-{row['line_index']}-{int(time.time() * 1000)}"
+            workflow = with_output_prefix(workflow, prefix)
+        except Exception as exc:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=str(exc))
+            return
+        result = self._run_comfy_workflow(
+            client, workflow, variables, self.workflows.avatar_output_targets(workflow_path), "avatar-image", project, row
+        )
+        if result.ok and result.output_files:
+            stored_output = self._localize_comfy_output(
+                project,
+                project_id=project_id,
+                item_kind="avatar-line",
+                item_index=int(row["line_index"]),
+                output_field="avatar_image_path",
+                output_path=result.output_files[0],
+            )
+            self.store.update_line(project_id, row["line_index"], **self._success_fields("avatar_image_path", self._project_storage_path(stored_output)))
+        else:
+            error = result.error or "No output files"
+            self.store.update_line(project_id, row["line_index"], status="failed", error=error)
+            raise RuntimeError(error)
+
+    def _run_comfy_for_avatar_segment(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_segment(project_id, row["segment_index"], status="running", error="", last_action="avatar-image")
+        try:
+            variables = _upload_avatar_workflow_inputs(client, variables, self._project_folder_name(project))
+            workflow = _inject_avatar_load_images(workflow, variables)
+            workflow = _inject_avatar_prompt(workflow, variables)
+            workflow = _randomize_workflow_seeds(workflow)
+            prefix = f"VocaVid/{self._project_folder_name(project)}/avatar-segment-{row['segment_index']}-{int(time.time() * 1000)}"
+            workflow = with_output_prefix(workflow, prefix)
+        except Exception as exc:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=str(exc))
+            return
+        result = self._run_comfy_workflow(
+            client, workflow, variables, self.workflows.avatar_output_targets(workflow_path), "avatar-image", project, row
+        )
+        if result.ok and result.output_files:
+            stored_output = self._localize_comfy_output(
+                project,
+                project_id=project_id,
+                item_kind="avatar-segment",
+                item_index=int(row["segment_index"]),
+                output_field="avatar_image_path",
+                output_path=result.output_files[0],
+            )
+            self.store.update_segment(project_id, row["segment_index"], **self._success_fields("avatar_image_path", self._project_storage_path(stored_output)))
+        else:
+            error = result.error or "No output files"
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=error)
+            raise RuntimeError(error)
+
+    def _run_comfy_for_prompt(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_line(project_id, row["line_index"], status="running", error="", last_action="prompts")
+        try:
+            prompt_workflow = inject_promptgen_context(workflow, variables)
+        except ValueError as exc:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=str(exc), last_action="prompts")
+            return
+        result = client.run_workflow(prompt_workflow, {})
+        if result.ok and result.text_outputs:
+            self.store.update_line(
+                project_id,
+                row["line_index"],
+                prompt=clean_generated_text(result.text_outputs[0]),
+                status="prompted",
+                error="",
+            )
+        elif result.ok and result.output_files:
+            self.store.update_line(
+                project_id,
+                row["line_index"],
+                prompt=json.dumps(result.output_files),
+                status="prompted",
+                error="",
+            )
+        else:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=result.error or "No text output")
+
+    def _run_comfy_for_segment_prompt(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_segment(project_id, row["segment_index"], status="running", error="", last_action="prompts")
+        try:
+            prompt_workflow = inject_promptgen_context(workflow, variables)
+        except ValueError as exc:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=str(exc), last_action="prompts")
+            return
+        result = client.run_workflow(prompt_workflow, {})
+        if result.ok and result.text_outputs:
+            self.store.update_segment(
+                project_id,
+                row["segment_index"],
+                prompt=clean_generated_text(result.text_outputs[0]),
+                status="prompted",
+                error="",
+            )
+        elif result.ok and result.output_files:
+            self.store.update_segment(
+                project_id,
+                row["segment_index"],
+                prompt=json.dumps(result.output_files),
+                status="prompted",
+                error="",
+            )
+        else:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=result.error or "No text output")
+
+    def _run_comfy_for_line_video_prompt(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_line(project_id, row["line_index"], status="running", error="", last_action="video-prompts")
+        try:
+            prompt_workflow = inject_videoprompt_context(workflow, variables)
+        except ValueError as exc:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=str(exc), last_action="video-prompts")
+            return
+        result = client.run_workflow(prompt_workflow, {})
+        if result.ok and result.text_outputs:
+            self.store.update_line(
+                project_id,
+                row["line_index"],
+                video_prompt=clean_generated_text(result.text_outputs[0]),
+                clip_path=None,
+                video_approved=0,
+                status="video prompted",
+                error="",
+            )
+        elif result.ok and result.output_files:
+            self.store.update_line(
+                project_id,
+                row["line_index"],
+                video_prompt=json.dumps(result.output_files),
+                clip_path=None,
+                video_approved=0,
+                status="video prompted",
+                error="",
+            )
+        else:
+            self.store.update_line(project_id, row["line_index"], status="failed", error=result.error or "No text output")
+
+    def _run_comfy_for_segment_video_prompt(self, project_id: int, row, workflow_path: Path) -> None:
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        self.store.update_segment(project_id, row["segment_index"], status="running", error="", last_action="video-prompts")
+        try:
+            prompt_workflow = inject_videoprompt_context(workflow, variables)
+        except ValueError as exc:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=str(exc), last_action="video-prompts")
+            return
+        result = client.run_workflow(prompt_workflow, {})
+        if result.ok and result.text_outputs:
+            self.store.update_segment(
+                project_id,
+                row["segment_index"],
+                video_prompt=clean_generated_text(result.text_outputs[0]),
+                clip_path=None,
+                video_approved=0,
+                status="video prompted",
+                error="",
+            )
+        elif result.ok and result.output_files:
+            self.store.update_segment(
+                project_id,
+                row["segment_index"],
+                video_prompt=json.dumps(result.output_files),
+                clip_path=None,
+                video_approved=0,
+                status="video prompted",
+                error="",
+            )
+        else:
+            self.store.update_segment(project_id, row["segment_index"], status="failed", error=result.error or "No text output")
+
+    def _run_comfy_for_scene_fill(self, project_id: int, row, item_kind: str, target_field: str, draft_text: str) -> None:
+        workflow_path = self._promptgen_workflow_path()
+        row_key = "segment_index" if item_kind == "segments" else "line_index"
+        update = self.store.update_segment if item_kind == "segments" else self.store.update_line
+        action_name = "ai-fill-video" if target_field == "video" else "ai-fill-image"
+        if not workflow_path:
+            update(project_id, row[row_key], status="failed", error="promptgen workflow is missing", last_action=action_name)
+            return
+
+        project = self.store.get_project(project_id)
+        workflow = load_workflow(workflow_path)
+        client = ComfyClient(project["comfy_base_url"])
+        variables = self._variables(project, row)
+        update(project_id, row[row_key], status="running", error="", last_action=action_name)
+        try:
+            prompt_workflow = inject_scenefill_context(workflow, variables, target_field, draft_text)
+        except ValueError as exc:
+            update(project_id, row[row_key], status="failed", error=str(exc), last_action=action_name)
+            return
+        result = client.run_workflow(prompt_workflow, {})
+        output_text = ""
+        if result.ok and result.text_outputs:
+            output_text = clean_generated_text(result.text_outputs[0])
+        elif result.ok and result.output_files:
+            output_text = json.dumps(result.output_files)
+        if not output_text:
+            update(project_id, row[row_key], status="failed", error=result.error or "No text output")
+            return
+
+        if target_field == "video":
+            update(project_id, row[row_key], video_prompt=output_text, clip_path=None, video_approved=0, status="video prompted", error="")
+        else:
+            update(project_id, row[row_key], prompt=output_text, status="prompted", error="")
+
+    def _localize_comfy_output(
+        self,
+        project,
+        project_id: int,
+        item_kind: str,
+        item_index: int,
+        output_field: str,
+        output_path: str,
+    ) -> Path:
+        target_dir = self._project_dir(project, project_id) / _asset_folder(output_field)
+        extension = Path(output_path.replace("\\", "/")).suffix or _default_extension(output_field)
+        target = target_dir / f"{item_kind}-{item_index:03d}{extension}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        source = Path(output_path)
+        if source.exists():
+            shutil.copy2(source, target)
+            return target
+
+        self._download_file(_comfy_view_url(str(project["comfy_base_url"]), output_path), target)
+        return target
+
+    def _download_file(self, url: str, target: Path) -> None:
+        urlretrieve(url, target)
+
+    def _variables(self, project, row, prefer_avatar: bool = False) -> dict[str, str]:
+        references = json.loads(project["reference_image_paths"] or "[]")
+        resolved_references = [str(self._project_input_path(item)) for item in references]
+        reference_image_path = resolved_references[0] if resolved_references else str(Path.cwd() / "images" / "avatar.jpeg")
+        fullbody_reference_image_path = str(Path.cwd() / "images" / "avatar_fullbody.png")
+        base_image_path = self._workflow_path_value(_row_value(row, "image_path", "") or "")
+        avatar_image_path = self._workflow_path_value(_row_value(row, "avatar_image_path", "") or "")
+        selected_image_source = _normalize_image_source(_row_value(row, "selected_image_source", "avatar"))
+        use_avatar = prefer_avatar and avatar_image_path and selected_image_source != "image"
+        source_image_path = avatar_image_path if use_avatar else base_image_path
+        duration = 0.0
+        if row["start_sec"] is not None and row["end_sec"] is not None:
+            duration = float(row["end_sec"]) - float(row["start_sec"])
+        avatar_identity_context = _avatar_identity_context(project) if bool(_row_value(row, "use_reference", 0)) else ""
+        return {
+            "lyric_text": row["clean_text"],
+            "section": row["section"],
+            "is_chorus": str(bool(row["is_chorus"])).lower(),
+            "use_reference_image": str(bool(row["use_reference"])).lower(),
+            "global_style": project["global_style_prompt"],
+            "avatar_gender": _normalize_avatar_gender(_row_value(project, "avatar_gender", "")),
+            "avatar_face_description": _row_value(project, "avatar_face_description", "") or "",
+            "avatar_identity_context": avatar_identity_context,
+            "duration": f"{duration:.3f}",
+            "fps": str(project["fps"]),
+            "output_resolution": project["output_resolution"],
+            "reference_image_paths": json.dumps(resolved_references),
+            "reference_image_path": reference_image_path,
+            "reference_image_name": Path(reference_image_path).name if reference_image_path else "",
+            "fullbody_reference_image_path": fullbody_reference_image_path,
+            "fullbody_reference_image_name": Path(fullbody_reference_image_path).name,
+            "base_image_path": base_image_path,
+            "avatar_image_path": avatar_image_path,
+            # The avatar identity must only constrain video generation when the
+            # avatar-edited image is the actual image-to-video input.  Projects
+            # can inherit a global avatar description without using it for a
+            # particular clip.
+            "using_avatar_image": str(bool(use_avatar)).lower(),
+            "source_image_path": source_image_path,
+            "input_image_path": base_image_path,
+            "image_path": source_image_path or base_image_path,
+            "audio_path": self._workflow_path_value(_row_value(row, "audio_path", "") or ""),
+            "prompt": row["prompt"] or "",
+            "image_prompt": row["prompt"] or "",
+            "video_prompt": _row_value(row, "video_prompt", "") or "",
+            "scene_plan": _row_value(row, "scene_plan", "") or "",
+            "genre": project["genre"] or "",
+        }
+
+    def _workflow_path_value(self, value: str) -> str:
+        if not value:
+            return ""
+        return str(self._project_input_path(value))
+
+    def _project_avatar_reference_path(self, project) -> str:
+        references = json.loads(project["reference_image_paths"] or "[]")
+        resolved_references = [self._project_input_path(item) for item in references]
+        for item in resolved_references:
+            if item.exists():
+                return str(item)
+        fallback = Path.cwd() / "images" / "avatar.jpeg"
+        if fallback.exists():
+            return str(fallback)
+        raise FileNotFoundError("No avatar reference image available")
+
+
+def _row_value(row, key: str, default):
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _parse_manual_time(value: object) -> float:
+    text = str(value or "").strip().replace(",", ".")
+    if not text:
+        raise ValueError("Manual timing values are required")
+    parts = text.split(":")
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+        elif len(parts) == 2:
+            seconds = int(parts[0]) * 60 + float(parts[1])
+        elif len(parts) == 3:
+            seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(f"Invalid manual timing value: {text}") from exc
+    if seconds < 0:
+        raise ValueError("Manual timing values must be zero or greater")
+    return round(seconds, 6)
+
+
+def _normalize_avatar_gender(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"male", "female"} else ""
+
+
+def _avatar_identity_context(project) -> str:
+    gender = _normalize_avatar_gender(_row_value(project, "avatar_gender", ""))
+    face = str(_row_value(project, "avatar_face_description", "") or "").strip()
+    parts = []
+    if gender:
+        parts.append(f"{gender} lead vocalist")
+    if face:
+        parts.append(face)
+    return "; ".join(parts)
+
+
+def _editable_rows(rows):
+    return [row for row in rows if not bool(_row_value(row, "video_approved", 0))]
+
+
+def _format_scene_plan_text(plans: dict[int, str], fallback_reason: str) -> str:
+    lines = [f"Fallback scene plan used: {fallback_reason}."]
+    lines.extend(f"{index}: {plan}" for index, plan in plans.items())
+    return "\n".join(lines)
+
+
+def _scene_plan_batches(segments: list, batch_size: int = SCENE_PLAN_BATCH_SIZE) -> list[list]:
+    return [segments[start:start + batch_size] for start in range(0, len(segments), batch_size)]
+
+
+def _format_indices(indices: list[int]) -> str:
+    return ", ".join(str(index) for index in indices)
+
+
+def _format_successful_scene_plan_text(segment_plan: str, video_bible: str) -> str:
+    if not video_bible.strip():
+        return segment_plan
+    return f"Video bible:\n{video_bible.strip()}\n\nSegment plan:\n{segment_plan}"
+
+
+def _normalize_image_source(value: str) -> str:
+    return "image" if str(value or "").lower() == "image" else "avatar"
+
+
+def _distribute_in_transcript_window(lines: list[LyricLine], duration: float, words) -> list[LineTiming]:
+    if not words:
+        return distribute_evenly(lines, duration)
+    first_word_start = max(0.0, min(float(word.start_sec) for word in words))
+    last_word_end = min(duration, max(float(word.end_sec) for word in words))
+    if last_word_end <= first_word_start:
+        return distribute_evenly(lines, duration)
+
+    first_lyric = _first_non_instrumental_index(lines)
+    last_lyric = _last_non_instrumental_index(lines)
+    if first_lyric is None or last_lyric is None:
+        return distribute_evenly(lines, duration)
+
+    timings: list[LineTiming] = []
+    if first_lyric > 0:
+        timings.extend(_distribute_line_slice(lines[:first_lyric], 0.0, first_word_start))
+    timings.extend(_distribute_line_slice(lines[first_lyric : last_lyric + 1], first_word_start, last_word_end))
+    if last_lyric + 1 < len(lines):
+        timings.extend(_distribute_line_slice(lines[last_lyric + 1 :], last_word_end, duration))
+    return sorted(timings, key=lambda timing: timing.line_index)
+
+
+def _distribute_line_slice(lines: list[LyricLine], start_sec: float, end_sec: float) -> list[LineTiming]:
+    if not lines:
+        return []
+    start_sec = max(0.0, float(start_sec))
+    end_sec = max(start_sec, float(end_sec))
+    span = end_sec - start_sec
+    if span <= 0:
+        return [LineTiming(line.index, start_sec, start_sec, 0.0) for line in lines]
+    segment = span / len(lines)
+    timings: list[LineTiming] = []
+    for position, line in enumerate(lines):
+        line_start = round(start_sec + position * segment, 6)
+        line_end = round(end_sec if position == len(lines) - 1 else start_sec + (position + 1) * segment, 6)
+        timings.append(LineTiming(line.index, line_start, line_end, 0.0))
+    return timings
+
+
+def _first_non_instrumental_index(lines: list[LyricLine]) -> int | None:
+    for index, line in enumerate(lines):
+        if not _is_instrumental_line(line):
+            return index
+    return None
+
+
+def _last_non_instrumental_index(lines: list[LyricLine]) -> int | None:
+    for index in range(len(lines) - 1, -1, -1):
+        if not _is_instrumental_line(lines[index]):
+            return index
+    return None
+
+
+def _is_instrumental_line(line: LyricLine) -> bool:
+    return is_instrumental_section(line.clean_text) or is_instrumental_section(line.section)
+
+
+def _with_transition_handle_duration(project, variables: dict[str, str]) -> dict[str, str]:
+    updated = dict(variables)
+    duration = float(updated.get("duration") or 0)
+    handle = max(0.0, float(_row_value(project, "transition_handle_seconds", 0.5)))
+    updated["duration"] = f"{duration + handle:.3f}"
+    return updated
+
+
+def _upload_avatar_workflow_inputs(client: ComfyClient, variables: dict[str, str], project_folder_name: str) -> dict[str, str]:
+    updated = dict(variables)
+    upload_image = getattr(client, "upload_image", None)
+    if upload_image is None:
+        return updated
+    subfolder = f"VocaVid/{project_folder_name}/inputs"
+    for key in ("input_image_path", "reference_image_path", "fullbody_reference_image_path"):
+        value = updated.get(key, "")
+        if not value:
+            continue
+        path = Path(value)
+        if path.exists():
+            updated[key] = upload_image(path, subfolder=subfolder)
+    return updated
+
+
+def _upload_clip_workflow_inputs(client: ComfyClient, variables: dict[str, str], project_folder_name: str) -> dict[str, str]:
+    updated = dict(variables)
+    upload_input = getattr(client, "upload_input", None) or getattr(client, "upload_image", None)
+    if upload_input is None:
+        return updated
+    subfolder = f"VocaVid/{project_folder_name}/inputs"
+    for key in ("image_path", "audio_path"):
+        value = updated.get(key, "")
+        if not value:
+            continue
+        path = Path(value)
+        if path.exists():
+            updated[key] = upload_input(path, subfolder=subfolder)
+    return updated
+
+
+def _inject_avatar_load_images(workflow: dict, variables: dict[str, str]) -> dict:
+    load_image_nodes = [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict)
+        and str(node.get("class_type", "")).lower() == "loadimage"
+        and isinstance(node.get("inputs"), dict)
+        and str(node.get("class_type", "")).lower() == "loadimage"
+    ]
+    node_by_id = {str(node_id): node for node_id, node in workflow.items() if node in load_image_nodes}
+    if {"76", "81"}.issubset(node_by_id):
+        load_image_nodes = [node_by_id["76"], node_by_id["81"]]
+    avatar_image = variables.get("reference_image_path", "") or variables.get("fullbody_reference_image_path", "")
+    replacements = [
+        variables.get("input_image_path", ""),
+        avatar_image,
+    ]
+    for node, replacement in zip(load_image_nodes, replacements):
+        if replacement:
+            node.setdefault("inputs", {})["image"] = replacement
+    return workflow
+
+
+def _inject_avatar_description_image(workflow: dict, variables: dict[str, str]) -> dict:
+    reference_image_path = variables.get("reference_image_path", "")
+    if not reference_image_path:
+        return workflow
+    for node in _nodes_by_class(workflow, "LoadImage"):
+        inputs = node["inputs"]
+        if "image" in inputs:
+            inputs["image"] = reference_image_path
+            break
+    return workflow
+
+
+def _inject_avatar_prompt(workflow: dict, variables: dict[str, str]) -> dict:
+    prompt = render_prompt_template(
+        load_named_prompt_template("avatar_image.txt", DEFAULT_AVATAR_IMAGE_TEMPLATE),
+        {
+            "image_prompt": variables.get("image_prompt", ""),
+            "IMAGE_PROMPT": variables.get("image_prompt", ""),
+            "scene_plan": variables.get("scene_plan", ""),
+            "SCENE_PLAN": variables.get("scene_plan", ""),
+            "genre": variables.get("genre", ""),
+            "GENRE": variables.get("genre", ""),
+            "global_style": variables.get("global_style", ""),
+            "GLOBAL_STYLE": variables.get("global_style", ""),
+            "avatar_gender": variables.get("avatar_gender", ""),
+            "AVATAR_GENDER": variables.get("avatar_gender", ""),
+            "avatar_face_description": variables.get("avatar_face_description", ""),
+            "AVATAR_FACE_DESCRIPTION": variables.get("avatar_face_description", ""),
+            "avatar_identity_context": variables.get("avatar_identity_context", ""),
+            "AVATAR_IDENTITY_CONTEXT": variables.get("avatar_identity_context", ""),
+        },
+    )
+    variables["prompt"] = prompt
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        title = str(node.get("_meta", {}).get("title", "")).lower()
+        class_type = str(node.get("class_type", "")).lower()
+        if "positive" not in title:
+            continue
+        if "text" in inputs and "cliptextencode" in class_type:
+            inputs["text"] = prompt
+            break
+        if "prompt" in inputs and ("textencode" in class_type or "qwen" in class_type):
+            inputs["prompt"] = prompt
+            break
+    return workflow
+
+
+def _inject_image_audio_video_inputs(workflow: dict, variables: dict[str, str]) -> dict:
+    image_path = variables.get("image_path", "")
+    audio_path = variables.get("audio_path", "")
+    duration = variables.get("duration", "")
+    avatar_identity_context = (
+        variables.get("avatar_identity_context", "")
+        if variables.get("using_avatar_image") == "true"
+        else ""
+    )
+    video_prompt = _with_avatar_identity_constraint(variables.get("video_prompt", ""), avatar_identity_context)
+    if image_path:
+        for node in _nodes_by_class(workflow, "LoadImage"):
+            inputs = node["inputs"]
+            if "image" in inputs:
+                inputs["image"] = image_path
+                break
+    if audio_path:
+        for node in _nodes_by_class(workflow, "LoadAudio"):
+            inputs = node["inputs"]
+            if "audio" in inputs:
+                inputs["audio"] = audio_path
+                inputs.pop("audioUI", None)
+                break
+    if duration:
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict) or "value" not in inputs:
+                continue
+            title = str(node.get("_meta", {}).get("title", "")).lower()
+            if node.get("class_type") == "PrimitiveFloat" and "duration" in title:
+                inputs["value"] = float(duration)
+                break
+    if video_prompt:
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict) or "value" not in inputs:
+                continue
+            title = str(node.get("_meta", {}).get("title", "")).lower()
+            if "prompt" in title:
+                inputs["value"] = video_prompt
+                break
+    return workflow
+
+
+def _with_avatar_identity_constraint(video_prompt: str, avatar_identity_context: str) -> str:
+    identity = str(avatar_identity_context or "").strip()
+    if not identity:
+        return video_prompt
+    constraint = (
+        "Identity lock: preserve the exact person and facial identity from the input image throughout the entire clip. "
+        f"Identity details: {identity}. "
+        "No face change, identity drift, age change, or altered facial features."
+    )
+    return f"{str(video_prompt or '').strip()}\n\n{constraint}".strip()
+
+
+def _output_node_ids(workflow: dict, class_types: set[str]) -> list[str]:
+    return [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and str(node.get("class_type", "")).lower() in class_types
+    ]
+
+
+def _randomize_workflow_seeds(workflow: dict) -> dict:
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for key, value in list(inputs.items()):
+            if _is_seed_input(key, value):
+                inputs[key] = _new_seed()
+    return workflow
+
+
+def _is_seed_input(key: str, value) -> bool:
+    normalized = str(key).lower()
+    return isinstance(value, int) and (
+        normalized == "seed"
+        or normalized.endswith("_seed")
+        or normalized.endswith(".seed")
+    )
+
+
+def _new_seed() -> int:
+    return secrets.randbelow(2**63 - 1) + 1
+
+
+def _nodes_by_class(workflow: dict, class_type: str) -> list[dict]:
+    return [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict)
+        and str(node.get("class_type", "")).lower() == class_type.lower()
+        and isinstance(node.get("inputs"), dict)
+    ]
+
+
+def _asset_folder(output_field: str) -> str:
+    return "clips" if output_field == "clip_path" else "images"
+
+
+def _default_extension(output_field: str) -> str:
+    return ".mp4" if output_field == "clip_path" else ".png"
+
+
+def _comfy_view_url(comfy_base_url: str, output_path: str) -> str:
+    path = Path(output_path.replace("\\", "/"))
+    filename = path.name
+    subfolder = path.parent.as_posix()
+    url = f"{comfy_base_url.rstrip('/')}/view?filename={quote(filename)}"
+    if subfolder and subfolder != ".":
+        url += f"&subfolder={quote(subfolder, safe='')}"
+    return f"{url}&type=output"

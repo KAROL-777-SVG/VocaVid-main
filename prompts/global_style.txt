@@ -1,0 +1,6 @@
+I want to create an AI music video for this song. Which "Global Style Prompt" should I use?
+
+Genre: {GENRE}
+Lyrics: {LYRICS}
+
+Return only the Global Style Prompt. Do not include labels, markdown, quotes, or explanations.

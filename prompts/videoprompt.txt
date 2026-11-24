@@ -1,0 +1,72 @@
+Create one concise image-to-video motion prompt for a music video segment.
+
+Return only the video prompt. Do not include labels, markdown, quotes, or explanations.
+
+Goal:
+Generate a controlled image-to-video motion prompt that starts from the existing still image and preserves visual continuity.
+Keep the same identity, face, wardrobe, setting, lighting, objects, pose, framing, and composition from the image prompt.
+Animate only what is already visible or explicitly described in the image prompt or scene plan.
+
+Mode: {MODE}
+Section: {SECTION}
+Duration seconds: {DURATION}
+Genre: {GENRE}
+Avatar identity: {AVATAR_IDENTITY_CONTEXT}
+Global visual style: {GLOBAL_STYLE}
+Scene plan: {SCENE_PLAN}
+Lyrics:
+{LYRICS}
+
+Image prompt:
+{IMAGE_PROMPT}
+
+Motion selection:
+
+* Choose one motion approach that fits this specific scene, section, duration, and energy.
+* Do not default to a slow push-in. Use it only when the scene plan or emotion clearly benefits from that choice.
+* Never describe motion as "almost imperceptible", "barely perceptible", "microscopic", "extremely slow", or "very slow". The selected motion must be clearly visible within the clip duration.
+* Prefer varied controlled motion across segments: lateral tracking, gentle crane rise, rack focus, foreground wipes, slow reveal, parallax drift, subtle handheld tension, locked-off rhythmic environment motion, or a small motivated pan or tilt.
+* For story or atmosphere shots, motion may come from the subject, camera, foreground, weather, light, particles, props already present, or the environment.
+* For performance shots, keep the singer lip-sync stable while making the frame feel alive through expression, light, atmosphere, and motivated camera movement.
+* If any character, singer, performer, face, or person is visible, show visible singing or lip-sync with clear but natural mouth movement matched to the lyric emotion.
+* Visible characters should not be silent posing, silently staring, or acting out unrelated business while the lyric plays.
+
+Performance shot rules:
+
+* The singer stays in the same physical position throughout the shot.
+* The singer does not walk, run, step forward, approach the camera, dance, jump, or make large body movements.
+* Motion should come from facial expression, mouth movement, breath, eye contact, slight head movement, small shoulder tension, hair, clothing, and the environment.
+* Keep the face and head stable enough for later lip-sync.
+* Describe singing intensity through the mouth, eyes, jaw, breath, and expression, not through body travel.
+* The singer should remain centered and recognizable, with stable facial features.
+
+Camera rules:
+
+* Use controlled camera movement only.
+* Good options: locked-off shot with active environment motion, lateral tracking, gentle crane rise, rack focus, foreground wipe, slow reveal, parallax drift, subtle zoom, gentle handheld micro-drift, small tilt, minimal pan, or a restrained push-in.
+* If using a push-in or zoom, clearly state that the camera moves while the singer remains fixed in place.
+* Avoid strong orbit, fast dolly, shaky handheld, whip pan, or aggressive reframing unless explicitly required.
+
+Environment motion:
+
+* Add subtle believable movement in the scene: smoke drifting, embers floating, rain falling, lights flickering, shadows moving, fabric shifting, hair moving, dust in the air.
+* Environment motion should support the rhythm and emotion without changing the scene layout.
+* Rhythmic lighting may pulse, flicker, or shift color with the music. Keep the subject's face recognizable and identity-stable; avoid full-face blackout, rapid strobing, or lighting that makes the face appear to change.
+
+Continuity rules:
+
+* Write one continuous visual moment in one shot. Do not describe cuts, transitions, a second angle, a new scene, a shot sequence, or temporal storytelling such as "first... then...", "suddenly", or "eventually".
+* Preserve the person, face, identity, clothing, objects, location, composition, and scene layout from the input image. Refer to an already visible person simply as the same person, singer, performer, or character; do not add or reinterpret physical attributes.
+* Do not add people, duplicates, crowds, background characters, vehicles, buildings, accessories, or props not visible in the image or explicitly requested.
+* Keep spatial movement physically continuous. Do not make the subject enter or exit frame, pass the camera, disappear into the distance, become fully obscured, emerge from behind objects, or require a new viewpoint.
+* Use one simple, non-conflicting camera behavior. Avoid camera cuts, angle changes, orbiting, aggressive tracking, whip pans, fast pans or tilts, large dolly moves, dramatic push-ins, or extreme perspective shifts unless explicitly required.
+* Lip-sync must be clear, natural, and matched to the lyric emotion. Avoid shouting, screaming, exaggerated mouth opening, dramatic jaw movement, rapid head movement, or violent head nodding.
+* Environmental elements may move, but do not transform the weather, sky, lighting setup, location, or scene layout into a different visual state.
+
+Forbidden:
+walking, running, stepping forward, moving toward camera, lunging, dancing, jumping, large gestures, full-body travel, camera chasing the subject, unstable framing, face leaving frame, identity change, warped face, wardrobe change, setting change.
+Do not invent new props, furniture, vehicles, food, drinks, weapons, or everyday actions not already present or requested. No coffee cup, no mug, no drinking, no sitting down, no standing up, no picking up objects, and no entering or leaving the scene unless explicitly described.
+
+Output:
+Write one concise cinematic motion prompt in 2-4 sentences.
+Clearly separate subject motion, camera motion, and environment motion.

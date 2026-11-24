@@ -1,0 +1,72 @@
+Create one continuous music video scene-plan batch.
+
+Genre: {GENRE}
+Global visual style: {GLOBAL_STYLE}
+Total render segments: {TOTAL_SEGMENTS}
+Planning batch: {BATCH_NUMBER} of {BATCH_COUNT}
+Full project render segments: {FULL_PROJECT_TOTAL_SEGMENTS}
+Lyrics lines per normal clip: {LYRIC_GROUP_SIZE}
+Lyrics lines per chorus/refrain clip: {CHORUS_GROUP_SIZE}
+{VIDEO_BIBLE_CONTEXT}
+{CONTINUITY_CONTEXT}
+
+Assign one concise visual beat to each fixed render segment in this batch. The video bible and handoff context define the whole-song progression; do not restart the concept at a batch boundary.
+The video bible contains the Overall concept and visual progression; do not repeat them in this batch response.
+
+The scene plan must feel like a real edited music video, not a sequence of similar character shots.
+
+Chorus/refrain performance policy:
+
+* Every chorus/refrain segment with uses_reference=True must feature the reference performer as the focus person in a visible singing or lip-sync performance. Do not replace these segments with an environment, object, crowd, or anonymous figure.
+* For rock, metal, punk, pop-rock, country, folk, soul, gospel, and similar band-friendly genres, performance shots may include a microphone, live band, stage, backlights, crowd energy, dramatic silhouettes, and concert-scale lighting.
+* For electronic, EDM, synth, techno, ambient, DJ, or club-oriented genres, do not force a classic live band. Use genre-appropriate performance language such as microphone, DJ/controller setup, light rig, club, LED wall, projection, solo performer, or electronic stage.
+* Segments with uses_reference=False are song-world shots first: prioritize story, atmosphere, symbols, inserts, locations, objects, crowds, landscapes, abstraction, and environmental storytelling.
+* In segments with uses_reference=False, the singer may appear only as an occasional, brief performance fragment; never make the singer the primary subject in more than 1 out of 4 such segments in this batch, and never use consecutive singer-focused non-reference segments.
+* Every scene that includes the performer must show visible singing or lip-sync to the lyrics.
+
+Shot variety requirements:
+
+* Maximum 1 out of 3 consecutive segments may primarily show the main character walking or standing.
+* At least 50% of all segments must focus on something other than the main character.
+* Include a balanced mix of:
+
+  * performance shots,
+  * worldbuilding/location shots,
+  * symbolic metaphor shots,
+  * close-up object shots,
+  * machinery or environmental shots,
+  * memory/inner-conflict shots,
+  * abstract rhythm montage shots,
+  * large-scale chorus shots.
+* Every segment must introduce a new visual idea, camera angle, subject, movement, symbol, or emotional beat.
+* Repeated motifs are allowed only if they evolve visually or emotionally.
+
+Continuity rules:
+
+* Keep locations, motifs, color language, props, characters, atmosphere, and visual symbolism consistent across the full timeline.
+* Build a clear emotional progression from the beginning to the end.
+* Chorus/refrain segments should feel connected through recurring performance, identity, scale, or symbolic shots, but should escalate with each repetition.
+* Segments with uses_reference=True are mandatory reference-performer shots.
+* Segments with uses_reference=False must be used predominantly for worldbuilding, objects, machinery, symbolic imagery, crowds, landscapes, abstract rhythm shots, or environmental storytelling; do not describe the reference singer, their face, or their distinctive identity unless this is one of the occasional performance fragments permitted above.
+
+Creative interpretation rules:
+
+* Do not simply visualize the lyrics word-for-word.
+* Translate the lyrics into cinematic images, metaphors, atmosphere, and emotional beats.
+* Avoid generic phrases like "epic shot", "dramatic scene", or "dark atmosphere" unless supported by specific visual details.
+* Use concrete visual language: camera framing, subject, movement, lighting, location, color, action, and mood.
+* For each segment, make a concrete director's decision: shot_type, subject, camera/framing, movement, motif, and how it differs from nearby segments.
+* No dialogue, no text on screen unless explicitly requested.
+
+Return:
+Return every render segment index exactly once in this exact format:
+0: scene description
+1: scene description
+
+You must return exactly {TOTAL_SEGMENTS} numbered segment lines, from {FIRST_INDEX} to {LAST_INDEX}.
+Do not skip, merge, rename, or add segments.
+Use only the numeric index at the start of each segment line. Do not write "segment_index".
+Keep every scene description to one sentence of at most 30 words.
+
+Fixed render segments:
+{SEGMENTS}
